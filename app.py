@@ -3,33 +3,51 @@ PPT Content-Quality Validator  (Agent 1)
 =========================================
 Implements rules CQ-001 .. CQ-013 from Agent1.xlsx.
 
-Endpoint:  POST /validate
-Input (JSON): { "fileName": "...", "region": "AMER|EUR|MENA", "fileContent": "<base64 pptx>" }
-Health:    GET /health
+Exposes a single HTTP endpoint  POST /validate
+Input  (JSON):
+    {
+        "fileName": "MyDeck.pptx",         # optional, for reporting
+        "region":   "AMER",                # AMER | EUR | MENA  (AMER/EUR share thresholds)
+        "fileContent": "<base64 of .pptx>" # the PowerPoint file, base64 encoded
+    }
+Output (JSON):
+    {
+        "summary": "....",
+        "region": "AMER",
+        "totalSlides": 12,
+        "counts": {"fail": 3, "warn": 5, "pass": 40},
+        "issues": [ {slide, ruleId, capability, level, detail, recommendation}, ... ]
+    }
 
-Deployed on Vercel (Python serverless runtime).
-Vercel loads the top-level `app` (Flask WSGI) as the function handler.
+Run locally:
+    pip install flask python-pptx
+    python ppt_validator.py
+Then expose with:  ngrok http 5000
 """
 
 import base64
 import binascii
 import io
-import os
 import re
 
 from pptx import Presentation
 from pptx.util import Emu
 
-
-# ------------------------- Region handling ------------------------- #
+# ----------------------------------------------------------------------------- #
+#  Region handling
+# ----------------------------------------------------------------------------- #
 def normalize_region(region):
     if not region:
         return "AMER/EUR"
     r = region.strip().upper()
-    return "MENA" if "MENA" in r else "AMER/EUR"
+    if "MENA" in r:
+        return "MENA"
+    return "AMER/EUR"          # AMER, EUR, AMER/EUR, EMEA-west, default
 
 
-# ------------------------- Dictionaries ------------------------- #
+# ----------------------------------------------------------------------------- #
+#  Dictionaries used by the rules
+# ----------------------------------------------------------------------------- #
 VAGUE_TERMS = ["improve", "seamless", "cutting-edge", "significant",
                "strong", "better", "various", "many", "several"]
 SUPERLATIVES = ["best", "leading", "world-class", "unparalleled",
@@ -43,12 +61,18 @@ ACRONYM_RE = re.compile(r"\b([A-Z]{2,6})\b")
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
-# ------------------------- Slide extraction ------------------------- #
+# ----------------------------------------------------------------------------- #
+#  Slide text extraction
+# ----------------------------------------------------------------------------- #
 def is_footer_shape(shape, slide_height):
+    """Heuristic: shapes near the very bottom are footer/date/page-number."""
     try:
         if shape.top is None or shape.height is None:
             return False
         bottom = shape.top + shape.height
+        # A footer is a THIN strip sitting in the bottom 12% of the slide.
+        # Large body placeholders also end near the bottom, so we also require
+        # the shape height to be small (<= 10% of slide height).
         near_bottom = bottom > slide_height * 0.88
         thin = shape.height <= slide_height * 0.10
         return near_bottom and thin
@@ -79,18 +103,23 @@ def get_slide_data(prs):
                 continue
             for para in shape.text_frame.paragraphs:
                 p = "".join(run.text for run in para.runs).strip()
-                if p:
-                    bullets.append(p)
+                if not p:
+                    continue
+                bullets.append(p)
             body_text.append(txt)
         slides.append({
-            "index": idx + 1, "bullets": bullets,
-            "text": "\n".join(body_text), "footer": "\n".join(footer_text),
-            "has_table": has_table, "num_shapes": len(slide.shapes),
+            "index": idx + 1,
+            "bullets": bullets,
+            "text": "\n".join(body_text),
+            "footer": "\n".join(footer_text),
+            "has_table": has_table,
+            "num_shapes": len(slide.shapes),
         })
     return slides
 
 
 def classify_slide(sd, total):
+    """Rough cover / divider detection."""
     words = len(sd["text"].split())
     if sd["index"] == 1:
         return "cover"
@@ -99,10 +128,14 @@ def classify_slide(sd, total):
     return "content"
 
 
-# ------------------------- Rule engine ------------------------- #
+# ----------------------------------------------------------------------------- #
+#  Rule engine
+# ----------------------------------------------------------------------------- #
 def add(issues, slide, rid, cap, level, detail, rec):
-    issues.append({"slide": slide, "ruleId": rid, "capability": cap,
-                   "level": level, "detail": detail, "recommendation": rec})
+    issues.append({
+        "slide": slide, "ruleId": rid, "capability": cap,
+        "level": level, "detail": detail, "recommendation": rec,
+    })
 
 
 def count_words(text):
@@ -115,18 +148,22 @@ def validate_slide(sd, region, kind, issues):
     chars = len(re.sub(r"\s", "", text))
     lower = text.lower()
 
-    # CQ-001 Slide density
+    # ---- CQ-001 Slide density -------------------------------------------- #
     if kind == "content":
-        t_warn, t_fail = (160, 200) if region == "MENA" else (110, 140)
+        if region == "MENA":
+            t_warn, t_fail = 160, 200
+        else:
+            t_warn, t_fail = 110, 140
         if words > t_fail and not sd["has_table"]:
             add(issues, sd["index"], "CQ-001", "Slide density", "fail",
                 f"{words} words (fail >{t_fail}).",
                 "Split slide, convert prose to bullets, or move detail to appendix.")
         elif words > t_warn and not sd["has_table"]:
             add(issues, sd["index"], "CQ-001", "Slide density", "warn",
-                f"{words} words (warn >{t_warn}).", "Trim toward target range.")
+                f"{words} words (warn >{t_warn}).",
+                "Trim toward target range.")
 
-    # CQ-002 Character density
+    # ---- CQ-002 Character density ---------------------------------------- #
     c_fail = 1600 if region == "MENA" else 1200
     if chars > c_fail:
         add(issues, sd["index"], "CQ-002", "Character density", "fail",
@@ -135,7 +172,7 @@ def validate_slide(sd, region, kind, issues):
         add(issues, sd["index"], "CQ-002", "Character density", "warn",
             f"{chars} visible characters (warn >850).", "Shorten or group content.")
 
-    # CQ-003 Bullet length
+    # ---- CQ-003 Bullet length -------------------------------------------- #
     for b in sd["bullets"]:
         w, c = count_words(b), len(b)
         if w > 25 or c > 160:
@@ -144,9 +181,10 @@ def validate_slide(sd, region, kind, issues):
                 "Rewrite to a single action/outcome phrase.")
         elif w > 18 or c > 120:
             add(issues, sd["index"], "CQ-003", "Bullet length", "warn",
-                f'Bullet {w} words / {c} chars: "{b[:60]}..."', "Tighten toward 6-14 words.")
+                f'Bullet {w} words / {c} chars: "{b[:60]}..."',
+                "Tighten toward 6-14 words.")
 
-    # CQ-004 Bullet count
+    # ---- CQ-004 Bullet count --------------------------------------------- #
     nb = len(sd["bullets"])
     per_slide_fail = 12 if region == "MENA" else 8
     if kind == "content" and nb > per_slide_fail and not sd["has_table"]:
@@ -157,7 +195,7 @@ def validate_slide(sd, region, kind, issues):
         add(issues, sd["index"], "CQ-004", "Bullet count", "warn",
             f"{nb} bullets (target 3-5).", "Merge or prioritize.")
 
-    # CQ-005 Sentence length
+    # ---- CQ-005 Sentence length ------------------------------------------ #
     for s in SENTENCE_SPLIT.split(text):
         w = count_words(s)
         if w > 35:
@@ -168,7 +206,7 @@ def validate_slide(sd, region, kind, issues):
             add(issues, sd["index"], "CQ-005", "Sentence length", "warn",
                 f'{w}-word sentence: "{s[:60]}..."', "Shorten toward 12-22 words.")
 
-    # CQ-006 Paragraph length
+    # ---- CQ-006 Paragraph length ----------------------------------------- #
     for para in text.split("\n"):
         w = count_words(para)
         if w > 70:
@@ -178,7 +216,7 @@ def validate_slide(sd, region, kind, issues):
             add(issues, sd["index"], "CQ-006", "Paragraph length", "warn",
                 f"{w}-word paragraph.", "Break into bullets.")
 
-    # CQ-007 Weak/vague wording
+    # ---- CQ-007 Weak / vague wording ------------------------------------- #
     vague_hits = [t for t in VAGUE_TERMS if re.search(rf"\b{re.escape(t)}\b", lower)
                   and not EVIDENCE_RE.search(text)]
     if len(vague_hits) > 3:
@@ -190,14 +228,14 @@ def validate_slide(sd, region, kind, issues):
             f"Vague term(s): {', '.join(vague_hits)}.",
             "Add a metric or replace with a concrete outcome.")
 
-    # CQ-008 Unsupported superlatives
+    # ---- CQ-008 Unsupported superlatives --------------------------------- #
     sup_hits = [t for t in SUPERLATIVES if re.search(rf"\b{re.escape(t)}\b", lower)]
     if sup_hits and not EVIDENCE_RE.search(text):
         add(issues, sd["index"], "CQ-008", "Unsupported superlatives", "warn",
             f"Superlative(s) without evidence: {', '.join(sup_hits)}.",
             "Soften the claim or add a source/number.")
 
-    # CQ-009 Professional tone
+    # ---- CQ-009 Professional tone ---------------------------------------- #
     casual_hits = [t for t in CASUAL if t in lower]
     excl = "!" in text and kind not in ("cover",)
     if casual_hits or excl:
@@ -209,28 +247,29 @@ def validate_slide(sd, region, kind, issues):
         add(issues, sd["index"], "CQ-009", "Professional tone", "warn",
             "; ".join(d) + ".", "Rewrite in a formal, professional tone.")
 
-    # CQ-011 Completeness
+    # ---- CQ-011 Completeness --------------------------------------------- #
     ph = [p for p in PLACEHOLDERS if p in lower]
     if ph:
         add(issues, sd["index"], "CQ-011", "Completeness", "fail",
             f"Placeholder(s) present: {', '.join(ph)}.",
             "Provide the missing content before sharing.")
 
-    # CQ-012 Acronym hygiene
+    # ---- CQ-012 Acronym hygiene (per-slide, first use) ------------------- #
     for ac in set(ACRONYM_RE.findall(text)):
         if ac.upper() in APPROVED_ACRONYMS:
             continue
+        # expanded if "Word Word (AC)" pattern or full form near it
         if re.search(rf"\([^)]*{ac}[^)]*\)", text) or re.search(rf"{ac}\s*\(", text):
             continue
         add(issues, sd["index"], "CQ-012", "Acronym hygiene", "warn",
             f'Acronym "{ac}" not expanded on first use.',
             "Spell out the acronym the first time it appears.")
 
-    # CQ-013 Number formatting
+    # ---- CQ-013 Number formatting ---------------------------------------- #
     fmt = []
-    if re.search(r"\d+\s+[Xx]\s+\d+", text):
+    if re.search(r"\d+\s+[Xx]\s+\d+", text):          # 24 X 7
         fmt.append("use 24x7 not 24 X 7")
-    if re.search(r"\d\s%", text):
+    if re.search(r"\d+\s*%", text) and re.search(r"\d\s%", text):
         fmt.append("no space before %")
     if re.search(r"\$\s*\d+\s*(trillion|billion|million)", text, re.I):
         fmt.append("use compact $6T/$6B/$6M")
@@ -244,7 +283,8 @@ def validate_presentation(prs, region):
     total = len(slides)
     issues = []
     for sd in slides:
-        validate_slide(sd, region, classify_slide(sd, total), issues)
+        kind = classify_slide(sd, total)
+        validate_slide(sd, region, kind, issues)
 
     counts = {"fail": 0, "warn": 0}
     for i in issues:
@@ -257,18 +297,28 @@ def validate_presentation(prs, region):
     else:
         verdict = "PASS — no content-quality issues detected."
 
-    return {"summary": verdict, "region": region, "totalSlides": total,
-            "counts": counts, "issues": issues}
+    return {
+        "summary": verdict,
+        "region": region,
+        "totalSlides": total,
+        "counts": counts,
+        "issues": issues,
+    }
 
 
-# ------------------------- Base64 -> Presentation ------------------------- #
+# ----------------------------------------------------------------------------- #
+#  Robust base64 -> Presentation
+# ----------------------------------------------------------------------------- #
 def load_presentation_from_base64(b64):
     if b64 is None:
         raise ValueError("fileContent (base64) is missing.")
     s = b64.strip()
+    # strip data URI header if present
     if s.startswith("data:") and "," in s:
         s = s.split(",", 1)[1]
+    # keep only valid base64 characters (fixes 'non-ASCII' decode errors)
     s = re.sub(r"[^A-Za-z0-9+/=]", "", s)
+    # fix padding
     s += "=" * (-len(s) % 4)
     try:
         raw = base64.b64decode(s)
@@ -289,31 +339,29 @@ def run_validation(payload):
     return result
 
 
-# ------------------------- Flask app ------------------------- #
-from flask import Flask, request, jsonify
-app = Flask(__name__)
+# ----------------------------------------------------------------------------- #
+#  Flask app
+# ----------------------------------------------------------------------------- #
+def create_app():
+    from flask import Flask, request, jsonify
+    app = Flask(__name__)
 
+    @app.route("/validate", methods=["POST"])
+    def validate():
+        try:
+            payload = request.get_json(force=True, silent=True) or {}
+            return jsonify(run_validation(payload)), 200
+        except Exception as e:               # always return JSON so the flow can parse it
+            return jsonify({"error": str(e),
+                            "summary": "Validation failed.",
+                            "issues": []}), 200
 
-@app.route("/validate", methods=["POST"])
-def validate():
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-        return jsonify(run_validation(payload)), 200
-    except Exception as e:
-        return jsonify({"error": str(e), "summary": "Validation failed.",
-                        "issues": []}), 200
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok"}), 200
 
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"}), 200
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"service": "PPT Content Quality Validator", "status": "running"}), 200
+    return app
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    create_app().run(host="0.0.0.0", port=5000)
